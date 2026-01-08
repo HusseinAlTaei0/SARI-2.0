@@ -16,7 +16,7 @@ import {
   Sliders, Shield, Database, FileJson, Key, Bell, List, Plus, MessageCircle, AlertOctagon,
   MinusCircle, PlusCircle, Globe, Mail, FilePlus, Building2, Briefcase
 } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, BarChart, Bar } from 'recharts';
 import { SilkBackground } from './components/SilkBackground';
 import { utils, writeFile } from 'xlsx';
 
@@ -85,6 +85,7 @@ interface ReportStats {
     composition: { cash: number; debt: number; expense: number };
     chartData: { date: string; revenue: number; expenses: number }[];
     pieData: { name: string; value: number }[];
+    topDebtors: { name: string; amount: number }[];
 }
 
 // --- Constants ---
@@ -185,6 +186,31 @@ const generateId = () => `TX-${Math.floor(1000 + Math.random() * 9000)}`;
 const generateItemId = () => `ITM-${Math.floor(10000 + Math.random() * 90000)}`;
 const getStartOfMonth = () => { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), 1).toISOString().split('T')[0]; };
 const getToday = () => new Date().toISOString().split('T')[0];
+
+// --- Performance Optimization: Chart Sampling ---
+// Reduces the number of points rendered in the chart by averaging data in windows
+const optimizeChartData = (data: { fullDate: string; date: string; revenue: number; expenses: number }[], limit: number) => {
+    if (data.length <= limit) return data;
+
+    const result = [];
+    const windowSize = Math.ceil(data.length / limit);
+
+    for (let i = 0; i < data.length; i += windowSize) {
+        const window = data.slice(i, i + windowSize);
+        if (window.length === 0) continue;
+        
+        const avgRev = Math.round(window.reduce((sum, item) => sum + item.revenue, 0) / window.length);
+        const avgExp = Math.round(window.reduce((sum, item) => sum + item.expenses, 0) / window.length);
+        
+        result.push({
+            date: window[0].date, // Use the start date of the window as label
+            revenue: avgRev,
+            expenses: avgExp,
+            fullDate: window[0].fullDate
+        });
+    }
+    return result;
+};
 
 const App: React.FC = () => {
   // --- Auth & Config ---
@@ -341,58 +367,105 @@ const App: React.FC = () => {
   const reportStats = useMemo<ReportStats>(() => {
      const start = new Date(reportStartDate).getTime();
      const end = new Date(reportEndDate).getTime();
+     const lowerSearch = reportSearchTerm.toLowerCase();
      
      const filtered = transactions.filter(t => {
         const tDate = new Date(t.date).getTime();
-        return tDate >= start && tDate <= end;
+        const matchesDate = tDate >= start && tDate <= end;
+        const matchesSearch = !lowerSearch || 
+            t.client.toLowerCase().includes(lowerSearch) || 
+            t.amount.toString().includes(lowerSearch);
+        return matchesDate && matchesSearch;
      });
 
-     let totalRevenue = 0, totalExpenses = 0, totalCash = 0, totalDebt = 0, count = 0;
-     const productMap = new Map<string, number>();
-     const productCountMap = new Map<string, number>();
-     const dateMap = new Map<string, { revenue: number, expenses: number }>();
-     const weeklyMap = new Array(7).fill(0);
-     const pieMap = new Map<string, number>(); 
+     let revenue = 0, expenses = 0, pendingDebt = 0, collectedDebt = 0;
+     const dailyMap = new Map<string, { revenue: number, expenses: number }>();
+     const expenseCategoryMap = new Map<string, number>();
+     const productMap = new Map<string, {amount: number, count: number}>();
+     const debtorMap = new Map<string, number>();
+     const dayOfWeekMap = new Array(7).fill(0);
 
      filtered.forEach(t => {
         const val = t.currency === 'IQD' ? t.amount / EXCHANGE_RATE : t.amount;
-        const d = t.date;
-        if (!dateMap.has(d)) dateMap.set(d, { revenue: 0, expenses: 0 });
-        const dayEntry = dateMap.get(d)!;
+        const dateKey = t.date;
+        const dayIndex = new Date(t.date).getDay();
 
-        if (t.type === 'sale' || t.type === 'cash' || t.type === 'debt') {
-             totalRevenue += val; count++;
+        if (!dailyMap.has(dateKey)) dailyMap.set(dateKey, { revenue: 0, expenses: 0 });
+        const dayEntry = dailyMap.get(dateKey)!;
+
+        if (t.type === 'sale' && t.status === 'completed') {
+             revenue += val;
              dayEntry.revenue += val;
-             if (t.type === 'debt') totalDebt += val; else totalCash += val;
-             productMap.set(t.client, (productMap.get(t.client) || 0) + val);
-             productCountMap.set(t.client, (productCountMap.get(t.client) || 0) + 1);
-             const dateObj = new Date(t.date); if(!isNaN(dateObj.getTime())) weeklyMap[dateObj.getDay()] += val;
-        } else if (t.type === 'expense' || t.type === 'refund') {
-            totalExpenses += val;
+             
+             const cur = productMap.get(t.client) || {amount: 0, count: 0};
+             productMap.set(t.client, { amount: cur.amount + val, count: cur.count + 1});
+             
+             if(!isNaN(dayIndex)) dayOfWeekMap[dayIndex] += val;
+        } else if (t.type === 'expense') {
+            expenses += val;
             dayEntry.expenses += val;
-            pieMap.set(t.client, (pieMap.get(t.client) || 0) + val);
+            expenseCategoryMap.set(t.client, (expenseCategoryMap.get(t.client) || 0) + val);
+        } else if (t.type === 'debt') {
+            if (t.status === 'pending') {
+                pendingDebt += val;
+                debtorMap.set(t.client, (debtorMap.get(t.client) || 0) + val);
+            } else if (t.status === 'completed') {
+                collectedDebt += val;
+                revenue += val; // Paid debt is revenue
+                dayEntry.revenue += val;
+            }
         }
      });
 
-     const products = Array.from(productMap.entries()).map(([name, amount]) => ({ name, amount, count: productCountMap.get(name) || 0 })).sort((a, b) => b.amount - a.amount);
-     const chartData = Array.from(dateMap.entries()).map(([date, data]) => ({ date: date.split('-').slice(1).join('/'), ...data })).sort((a, b) => a.date.localeCompare(b.date));
-     const pieData = Array.from(pieMap.entries()).map(([name, value]) => ({ name, value }));
-     let maxDay = -1, maxDayIdx = 0;
-     weeklyMap.forEach((v, i) => { if(v > maxDay) { maxDay = v; maxDayIdx = i; } });
+     const topProducts = Array.from(productMap.entries())
+        .map(([name, data]) => ({ name, ...data }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 5);
+     
+     // Build raw chart data
+     const rawChartData = Array.from(dailyMap.entries())
+        .map(([date, data]) => ({ 
+            fullDate: date,
+            date: date.split('-').slice(1).join('/'), 
+            ...data 
+        }))
+        .sort((a, b) => a.fullDate.localeCompare(b.fullDate));
+
+     // Optimize chart data for large datasets (max 100 points)
+     const chartData = optimizeChartData(rawChartData, 100);
+
+     const pieData = Array.from(expenseCategoryMap.entries())
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value);
+
+     const topDebtors = Array.from(debtorMap.entries())
+        .map(([name, amount]) => ({ name, amount }))
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 5);
+
+     const weeklyActivity = WEEK_DAYS.map((day, i) => ({ day, amount: dayOfWeekMap[i] }));
+
+     let maxDayVal = -1; 
+     let maxDayName = "N/A";
+     dayOfWeekMap.forEach((v, i) => { if(v > maxDayVal) { maxDayVal = v; maxDayName = WEEK_DAYS_FULL[i]; }});
 
      return {
-        totalRevenue, totalExpenses, netProfit: totalRevenue - totalExpenses,
-        collectionRate: totalRevenue > 0 ? (totalCash / totalRevenue) * 100 : 0,
-        atv: count > 0 ? totalRevenue / count : 0,
-        topProducts: products.slice(0, 5),
-        bottomProducts: products.filter(p => p.amount > 0).slice(-5).reverse(),
+        totalRevenue: revenue,
+        totalExpenses: expenses,
+        netProfit: revenue - expenses,
+        collectionRate: (collectedDebt + pendingDebt) > 0 ? (collectedDebt / (collectedDebt + pendingDebt)) * 100 : 0,
+        atv: 0,
+        topProducts,
+        bottomProducts: [],
         dailyTrend: [],
-        weeklyActivity: WEEK_DAYS_FULL.map((day, idx) => ({ day, amount: weeklyMap[idx] })),
-        busiestDay: maxDay > 0 ? WEEK_DAYS_FULL[maxDayIdx] : "N/A",
-        composition: { cash: totalCash, debt: totalDebt, expense: totalExpenses },
-        chartData, pieData
+        weeklyActivity,
+        busiestDay: maxDayName,
+        composition: { cash: 0, debt: pendingDebt, expense: expenses },
+        chartData,
+        pieData,
+        topDebtors
      };
-  }, [transactions, reportStartDate, reportEndDate]);
+  }, [transactions, reportStartDate, reportEndDate, reportSearchTerm]);
 
   // --- Inventory Stats ---
   const inventoryStats = useMemo(() => {
@@ -928,6 +1001,226 @@ const App: React.FC = () => {
             </motion.div>
           )}
 
+          {activeTab === 'reports' && (
+            <motion.div key="reports" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="max-w-7xl mx-auto space-y-8">
+                {/* --- Luxury Glassmorphism Panel --- */}
+                <div className="relative p-8 rounded-[2.5rem] bg-gradient-to-b from-white/5 to-black/20 border border-white/10 backdrop-blur-2xl overflow-hidden shadow-2xl">
+                    {/* Decorative background elements */}
+                    <div className="absolute top-0 left-0 w-full h-px bg-gradient-to-r from-transparent via-white/20 to-transparent opacity-50" />
+                    <div className="absolute -top-40 -right-40 w-96 h-96 bg-sari-purple/20 blur-[100px] rounded-full pointer-events-none mix-blend-screen" />
+                    
+                    {/* Header Section */}
+                    <div className="relative z-10 flex flex-col md:flex-row justify-between items-start md:items-end gap-6 mb-10">
+                        <div>
+                            <h2 className="text-4xl font-bold text-white mb-2 tracking-tight">التقرير التنفيذي</h2>
+                            <div className="flex items-center gap-2 text-white/40 text-sm">
+                                <Activity size={16} />
+                                <span>نظرة شاملة على أداء المتجر</span>
+                            </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-3">
+                             <div className="group relative bg-[#0a0a0c] border border-white/10 rounded-2xl px-4 py-2 flex flex-col min-w-[180px] focus-within:border-white/20 transition-colors">
+                                <div className="flex items-center gap-2 mb-1">
+                                    <Search size={12} className="text-white/40 group-focus-within:text-sari-purple transition-colors" />
+                                    <span className="text-[10px] text-white/40 font-medium">بحث</span>
+                                </div>
+                                <input 
+                                    type="text" 
+                                    value={reportSearchTerm} 
+                                    onChange={e => setReportSearchTerm(e.target.value)} 
+                                    className="bg-transparent border-none text-white text-sm focus:outline-none p-0 w-full placeholder:text-white/20" 
+                                    placeholder="عميل، مبلغ..."
+                                />
+                            </div>
+
+                             <div className="group relative bg-[#0a0a0c] border border-white/10 rounded-2xl px-4 py-2 flex flex-col min-w-[140px] focus-within:border-white/20 transition-colors">
+                                <span className="text-[10px] text-white/40 font-medium mb-0.5">من</span>
+                                <input style={{colorScheme: 'dark'}} type="date" value={reportStartDate} onChange={e=>setReportStartDate(e.target.value)} className="bg-transparent border-none text-white font-num text-sm focus:outline-none p-0 w-full" />
+                            </div>
+                            
+                            <div className="group relative bg-[#0a0a0c] border border-white/10 rounded-2xl px-4 py-2 flex flex-col min-w-[140px] focus-within:border-white/20 transition-colors">
+                                <span className="text-[10px] text-white/40 font-medium mb-0.5">إلى</span>
+                                <input style={{colorScheme: 'dark'}} type="date" value={reportEndDate} onChange={e=>setReportEndDate(e.target.value)} className="bg-transparent border-none text-white font-num text-sm focus:outline-none p-0 w-full" />
+                            </div>
+
+                            <button onClick={() => window.print()} className="w-[58px] h-[58px] flex items-center justify-center bg-white/5 border border-white/10 rounded-2xl hover:bg-white/10 text-white transition-all hover:scale-105 active:scale-95">
+                                <Printer size={22} />
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* KPI Cards Grid */}
+                    <div className="relative z-10 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                        
+                        {/* Revenue Card */}
+                        <div className="p-6 rounded-[2rem] bg-[#0f0f11]/60 border border-white/5 shadow-xl backdrop-blur-md relative overflow-hidden group hover:border-emerald-500/30 transition-all duration-300">
+                            <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+                            <div className="relative z-10">
+                                <div className="flex items-center gap-3 mb-6">
+                                    <div className="w-10 h-10 rounded-xl border border-emerald-500/20 flex items-center justify-center text-emerald-400 bg-emerald-500/10 shadow-[0_0_15px_-3px_rgba(16,185,129,0.2)]">
+                                        <Wallet size={20} />
+                                    </div>
+                                    <span className="text-emerald-400 font-bold text-sm">إجمالي الإيرادات</span>
+                                </div>
+                                <div className="text-4xl font-bold text-white font-num tracking-tight">{formatCurrency(reportStats.totalRevenue, 'USD')}</div>
+                            </div>
+                        </div>
+
+                        {/* Expenses Card */}
+                        <div className="p-6 rounded-[2rem] bg-[#0f0f11]/60 border border-white/5 shadow-xl backdrop-blur-md relative overflow-hidden group hover:border-amber-500/30 transition-all duration-300">
+                            <div className="absolute inset-0 bg-gradient-to-br from-amber-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+                            <div className="relative z-10">
+                                <div className="flex items-center gap-3 mb-6">
+                                    <div className="w-10 h-10 rounded-xl border border-amber-500/20 flex items-center justify-center text-amber-400 bg-amber-500/10 shadow-[0_0_15px_-3px_rgba(245,158,11,0.2)]">
+                                        <ArrowDownLeft size={20} />
+                                    </div>
+                                    <span className="text-amber-400 font-bold text-sm">المصروفات</span>
+                                </div>
+                                <div className="text-4xl font-bold text-white font-num tracking-tight">{formatCurrency(reportStats.totalExpenses, 'USD')}</div>
+                            </div>
+                        </div>
+
+                        {/* Net Profit Card */}
+                        <div className="p-6 rounded-[2rem] bg-[#0f0f11]/60 border border-white/5 shadow-xl backdrop-blur-md relative overflow-hidden group hover:border-blue-500/30 transition-all duration-300">
+                            <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+                            <div className="relative z-10">
+                                <div className="flex items-center gap-3 mb-6">
+                                    <div className="w-10 h-10 rounded-xl border border-blue-500/20 flex items-center justify-center text-blue-400 bg-blue-500/10 shadow-[0_0_15px_-3px_rgba(59,130,246,0.2)]">
+                                        <TrendingUp size={20} />
+                                    </div>
+                                    <span className="text-blue-400 font-bold text-sm">صافي الربح</span>
+                                </div>
+                                <div className="text-4xl font-bold text-white font-num tracking-tight">{formatCurrency(reportStats.netProfit, 'USD')}</div>
+                            </div>
+                        </div>
+
+                        {/* Debt Collection Card */}
+                        <div className="p-6 rounded-[2rem] bg-[#0f0f11]/60 border border-white/5 shadow-xl backdrop-blur-md relative overflow-hidden group hover:border-rose-500/30 transition-all duration-300">
+                            <div className="absolute inset-0 bg-gradient-to-br from-rose-500/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+                            <div className="relative z-10">
+                                <div className="flex items-center gap-3 mb-6">
+                                    <div className="w-10 h-10 rounded-xl border border-rose-500/20 flex items-center justify-center text-rose-400 bg-rose-500/10 shadow-[0_0_15px_-3px_rgba(244,63,94,0.2)]">
+                                        <RefreshCcw size={20} />
+                                    </div>
+                                    <span className="text-rose-400 font-bold text-sm">تحصيل الديون</span>
+                                </div>
+                                <div className="text-4xl font-bold text-white font-num tracking-tight mb-2">{reportStats.collectionRate.toFixed(1)}%</div>
+                                <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
+                                    <motion.div 
+                                        initial={{ width: 0 }} 
+                                        animate={{ width: `${reportStats.collectionRate}%` }} 
+                                        className="h-full bg-gradient-to-r from-rose-500 to-rose-400 rounded-full shadow-[0_0_10px_rgba(244,63,94,0.5)]"
+                                    />
+                                </div>
+                            </div>
+                        </div>
+
+                    </div>
+                </div>
+
+                {/* --- Main Chart: Sales Trend --- */}
+                <div className="h-[400px] p-6 bg-gradient-to-b from-white/5 to-black/20 border border-white/10 rounded-[2.5rem] backdrop-blur-xl flex flex-col shadow-xl">
+                    <h3 className="text-white font-bold mb-6 flex items-center gap-2"><Activity className="text-sari-purple" size={20} /> التحليل الزمني للإيرادات</h3>
+                    <div className="flex-1 w-full min-h-0">
+                        <ResponsiveContainer width="100%" height="100%">
+                            <AreaChart data={reportStats.chartData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                                <defs>
+                                    <linearGradient id="colorRevReport" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/><stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                                    </linearGradient>
+                                    <linearGradient id="colorExpReport" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3}/><stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/>
+                                    </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} />
+                                <XAxis dataKey="date" stroke="#9ca3af" tick={{fill: '#6b7280', fontSize: 10}} tickLine={false} axisLine={false} />
+                                <YAxis stroke="#9ca3af" tick={{fill: '#6b7280', fontSize: 10}} tickLine={false} axisLine={false} tickFormatter={(value) => `${value}`} />
+                                <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '12px', color: '#fff' }} />
+                                <Legend verticalAlign="top" height={36} iconType="circle" />
+                                <Area type="monotone" dataKey="revenue" name="الإيرادات" stroke="#10b981" strokeWidth={3} fillOpacity={1} fill="url(#colorRevReport)" />
+                                <Area type="monotone" dataKey="expenses" name="المصروفات" stroke="#f59e0b" strokeWidth={3} fillOpacity={1} fill="url(#colorExpReport)" />
+                            </AreaChart>
+                        </ResponsiveContainer>
+                    </div>
+                </div>
+
+                {/* --- Secondary Row: Insights Grid --- */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* Spending Analysis */}
+                    <div className="p-6 bg-white/5 border border-white/10 rounded-[2rem] backdrop-blur-xl flex flex-col h-[350px]">
+                        <h3 className="text-white font-bold mb-4 flex items-center gap-2"><PieChartIcon className="text-amber-400" size={18} /> تحليل الإنفاق</h3>
+                        <div className="flex-1 relative">
+                            {reportStats.totalExpenses > 0 ? (
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <PieChart>
+                                        <Pie data={reportStats.pieData} innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">
+                                            {reportStats.pieData.map((entry, index) => (<Cell key={`cell-${index}`} fill={['#f59e0b', '#ef4444', '#3b82f6', '#8b5cf6'][index % 4]} />))}
+                                        </Pie>
+                                        <Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }} />
+                                        <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{fontSize: '10px'}} />
+                                    </PieChart>
+                                </ResponsiveContainer>
+                            ) : (
+                                <div className="absolute inset-0 flex items-center justify-center text-white/30 text-sm">لا توجد بيانات مصروفات</div>
+                            )}
+                        </div>
+                    </div>
+
+                    {/* Peak Days */}
+                    <div className="p-6 bg-white/5 border border-white/10 rounded-[2rem] backdrop-blur-xl flex flex-col h-[350px]">
+                        <h3 className="text-white font-bold mb-4 flex items-center gap-2"><CalendarDays className="text-blue-400" size={18} /> نشاط الأسبوع</h3>
+                        <div className="flex-1 w-full min-h-0">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={reportStats.weeklyActivity}>
+                                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} />
+                                    <XAxis dataKey="day" stroke="#9ca3af" tick={{fill: '#6b7280', fontSize: 10}} tickLine={false} axisLine={false} />
+                                    <Tooltip cursor={{fill: 'rgba(255,255,255,0.05)'}} contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px', color: '#fff' }} />
+                                    <Bar dataKey="amount" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+
+                    {/* Top Products List */}
+                    <div className="p-6 bg-white/5 border border-white/10 rounded-[2rem] backdrop-blur-xl flex flex-col h-[350px]">
+                        <h3 className="text-white font-bold mb-4 flex items-center gap-2"><Package className="text-emerald-400" size={18} /> الأكثر مبيعاً</h3>
+                        <div className="flex-1 overflow-y-auto custom-scrollbar pr-2 space-y-4">
+                            {reportStats.topProducts.map((p, i) => (
+                                <div key={i} className="group">
+                                    <div className="flex justify-between text-xs mb-1">
+                                        <span className="text-white font-medium">{p.name}</span>
+                                        <span className="text-white/60 font-num">{formatCurrency(p.amount, 'IQD')}</span>
+                                    </div>
+                                    <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                                        <div className="h-full bg-emerald-500 rounded-full group-hover:bg-emerald-400 transition-colors" style={{ width: `${Math.min((p.amount / (reportStats.topProducts[0]?.amount || 1)) * 100, 100)}%` }}></div>
+                                    </div>
+                                </div>
+                            ))}
+                            {reportStats.topProducts.length === 0 && <div className="text-center text-white/30 text-xs py-10">لا توجد بيانات</div>}
+                        </div>
+                    </div>
+                </div>
+
+                {/* --- Bottom Row: Top Debtors --- */}
+                <div className="p-6 bg-white/5 border border-white/10 rounded-[2rem] backdrop-blur-xl">
+                    <h3 className="text-white font-bold mb-4 flex items-center gap-2"><Users className="text-rose-400" size={18} /> قائمة كبار المدينين</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {reportStats.topDebtors.map((d, i) => (
+                            <div key={i} className="flex items-center justify-between p-4 rounded-2xl bg-white/5 border border-white/5 hover:border-rose-500/30 transition-all">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-10 h-10 rounded-full bg-rose-500/10 text-rose-500 flex items-center justify-center font-bold">{d.name.charAt(0)}</div>
+                                    <div className="text-sm font-bold text-white">{d.name}</div>
+                                </div>
+                                <div className="text-rose-400 font-bold font-num">{formatCurrency(d.amount, 'IQD')}</div>
+                            </div>
+                        ))}
+                        {reportStats.topDebtors.length === 0 && <div className="col-span-full text-center text-white/30 text-sm py-4">لا توجد ديون مستحقة</div>}
+                    </div>
+                </div>
+            </motion.div>
+          )}
+
           {activeTab === 'inventory' && (
             <motion.div key="inventory" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-4 gap-6">
                 {/* --- Inventory Left Stats --- */}
@@ -1026,50 +1319,117 @@ const App: React.FC = () => {
             </motion.div>
           )}
 
-          {activeTab === 'reports' && (
-            <motion.div key="reports" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="max-w-7xl mx-auto space-y-8"><div className="flex justify-between items-end border-b border-white/5 pb-6"><div><h2 className="text-3xl font-bold text-white">التقرير التنفيذي</h2><p className="text-white/40">نظرة شاملة</p></div><div className="flex gap-2"><input type="date" value={reportStartDate} onChange={e=>setReportStartDate(e.target.value)} className="bg-white/5 border border-white/10 rounded-full px-4 py-2 text-white font-num"/><input type="date" value={reportEndDate} onChange={e=>setReportEndDate(e.target.value)} className="bg-white/5 border border-white/10 rounded-full px-4 py-2 text-white font-num"/></div></div><div className="grid grid-cols-3 gap-6"><div className="p-8 rounded-[2rem] bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border border-emerald-500/10 text-center"><span className="text-emerald-200/60 block mb-1">إجمالي الإيرادات</span><span className="text-4xl font-num font-bold text-emerald-400">{formatCurrency(reportStats.totalRevenue, 'USD')}</span></div><div className="p-8 rounded-[2rem] bg-gradient-to-br from-amber-500/10 to-amber-500/5 border border-amber-500/10 text-center"><span className="text-amber-200/60 block mb-1">إجمالي المصروفات</span><span className="text-4xl font-num font-bold text-amber-400">{formatCurrency(reportStats.totalExpenses, 'USD')}</span></div><div className="p-8 rounded-[2rem] bg-gradient-to-br from-blue-500/10 to-blue-500/5 border border-blue-500/10 text-center"><span className="text-blue-200/60 block mb-1">صافي الربح</span><span className="text-4xl font-num font-bold text-blue-400">{formatCurrency(reportStats.netProfit, 'USD')}</span></div></div>
-                {/* Charts Area */}
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                   <div className="lg:col-span-2 p-6 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl h-[400px] flex flex-col"><h3 className="text-white font-bold mb-6 flex items-center gap-2"><Activity size={18} className="text-sari-purple" /> التحليل الزمني للإيرادات</h3><div className="flex-1 w-full h-full min-h-0"><ResponsiveContainer width="100%" height="100%"><AreaChart data={reportStats.chartData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}><defs><linearGradient id="colorRev" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#10b981" stopOpacity={0.3}/><stop offset="95%" stopColor="#10b981" stopOpacity={0}/></linearGradient><linearGradient id="colorExp" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3}/><stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" vertical={false} /><XAxis dataKey="date" stroke="#9ca3af" tick={{fill: '#6b7280', fontSize: 10}} tickLine={false} axisLine={false} /><YAxis stroke="#9ca3af" tick={{fill: '#6b7280', fontSize: 10}} tickLine={false} axisLine={false} tickFormatter={(value) => `$${value}`} /><Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '12px', color: '#fff' }} /><Area type="monotone" dataKey="revenue" stroke="#10b981" strokeWidth={3} fillOpacity={1} fill="url(#colorRev)" name="Revenue" /><Area type="monotone" dataKey="expenses" stroke="#f59e0b" strokeWidth={3} fillOpacity={1} fill="url(#colorExp)" name="Expenses" /></AreaChart></ResponsiveContainer></div></div>
-                   <div className="p-6 rounded-3xl bg-white/5 border border-white/10 backdrop-blur-xl h-[400px] flex flex-col"><h3 className="text-white font-bold mb-6 flex items-center gap-2"><PieChartIcon size={18} className="text-amber-400" /> توزيع المصروفات</h3><div className="flex-1 relative">{reportStats.totalExpenses > 0 ? (<ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={reportStats.pieData} innerRadius={60} outerRadius={80} paddingAngle={5} dataKey="value">{reportStats.pieData.map((entry, index) => (<Cell key={`cell-${index}`} fill={['#f59e0b', '#ef4444', '#3b82f6', '#8b5cf6'][index % 4]} />))}</Pie><Tooltip contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '8px' }} /><Legend verticalAlign="bottom" height={36} iconType="circle" /></PieChart></ResponsiveContainer>) : (<div className="absolute inset-0 flex items-center justify-center text-white/30 text-sm">لا توجد بيانات مصروفات</div>)}</div></div>
-                </div>
-            </motion.div>
-          )}
-
           {activeTab === 'settings' && (
-            <motion.div key="settings" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="max-w-4xl mx-auto grid grid-cols-1 md:grid-cols-4 gap-8">
-               {/* Vertical Tabs */}
-               <div className="md:col-span-1 space-y-2">
-                   {[{id:'store', label:'المتجر', icon: Store}, {id:'companies', label:'الشركات', icon: Building2}, {id:'security', label:'الأمان', icon: ShieldCheck}].map((t: any) => (
-                       <button key={t.id} onClick={() => setSettingsTab(t.id)} className={`w-full flex items-center gap-3 p-3 rounded-xl transition-all ${settingsTab === t.id ? 'bg-sari-purple text-white shadow-lg' : 'text-white/40 hover:bg-white/5'}`}>
-                           <t.icon size={18} /><span>{t.label}</span>
+            <motion.div key="settings" variants={pageVariants} initial="initial" animate="animate" exit="exit" className="max-w-5xl mx-auto">
+               
+               {/* Horizontal Tabs */}
+               <div className="flex flex-wrap items-center gap-4 mb-8">
+                   {[
+                     {id:'store', label:'المتجر', icon: Store}, 
+                     {id:'companies', label:'الشركات', icon: Building2}, 
+                     {id:'security', label:'الأمان', icon: ShieldCheck},
+                     {id:'data', label:'البيانات', icon: Database}
+                   ].map((t: any) => (
+                       <button 
+                         key={t.id} 
+                         onClick={() => setSettingsTab(t.id)} 
+                         className={`flex-1 min-w-[120px] flex flex-col md:flex-row items-center justify-center gap-3 p-4 rounded-3xl border transition-all ${
+                           settingsTab === t.id 
+                             ? 'bg-sari-purple border-sari-purple text-white shadow-lg shadow-sari-purple/20 scale-[1.02]' 
+                             : 'bg-white/5 border-white/10 text-white/40 hover:bg-white/10 hover:border-white/20'
+                         }`}
+                       >
+                           <t.icon size={20} />
+                           <span className="font-bold">{t.label}</span>
                        </button>
                    ))}
                </div>
 
                {/* Settings Content */}
-               <div className="md:col-span-3 space-y-6">
-                   {settingsTab === 'store' && (
-                       <div className="p-6 rounded-3xl bg-white/5 border border-white/10 space-y-4">
-                           <h3 className="font-bold text-white border-b border-white/10 pb-4 mb-4">بيانات المتجر</h3>
-                           <div><label className="text-xs text-white/50 block mb-2">اسم المتجر</label><input type="text" value={storeInfo.name} onChange={e => setStoreInfo({...storeInfo, name: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-3 text-white" /></div>
-                           <div><label className="text-xs text-white/50 block mb-2">العملة</label><select value={storeInfo.currencySymbol} onChange={e => setStoreInfo({...storeInfo, currencySymbol: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-3 text-white"><option value="IQD">Dinar (IQD)</option><option value="$">Dollar (USD)</option></select></div>
-                       </div>
-                   )}
+               <div className="bg-white/5 border border-white/10 rounded-[2.5rem] p-6 md:p-8 backdrop-blur-xl relative overflow-hidden">
                    
-                   {settingsTab === 'companies' && (
-                       <div className="p-6 rounded-3xl bg-white/5 border border-white/10 space-y-6">
-                           <div className="flex justify-between items-center border-b border-white/10 pb-4"><h3 className="font-bold text-white">إدارة الشركات والعملاء</h3><div className="flex gap-2"><input type="text" value={newCompany} onChange={e=>setNewCompany(e.target.value)} placeholder="اسم جديد..." className="bg-black/20 border border-white/10 rounded-xl px-3 py-1 text-sm text-white"/><button onClick={handleAddCompany} className="p-2 bg-sari-purple rounded-lg text-white"><Plus size={16}/></button></div></div>
-                           <div className="space-y-2 max-h-96 overflow-y-auto custom-scrollbar">
-                               {storeInfo.knownCompanies.map((c, i) => (
-                                   <div key={i} className="flex justify-between items-center p-3 rounded-xl bg-white/5 border border-white/5 group">
-                                           <div className="flex items-center gap-3"><div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-xs font-bold">{c.charAt(0)}</div><span className="text-white">{c}</span></div>
-                                           <button onClick={() => handleDeleteCompany(c)} className="text-white/20 hover:text-red-400"><Trash2 size={16}/></button>
-                                   </div>
-                               ))}
-                           </div>
-                       </div>
-                   )}
+                   {/* Background Glow */}
+                   <div className="absolute top-0 left-1/2 -translate-x-1/2 w-1/2 h-1/2 bg-sari-purple/5 blur-[100px] rounded-full pointer-events-none" />
+
+                   <div className="relative z-10">
+                     {settingsTab === 'store' && (
+                         <div className="space-y-6">
+                             <h3 className="text-2xl font-bold text-white mb-6 flex items-center gap-3">
+                               <div className="p-2 bg-sari-purple/20 rounded-xl text-sari-purple"><Store size={24}/></div>
+                               بيانات المتجر
+                             </h3>
+                             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                               <div className="space-y-2">
+                                 <label className="text-sm font-bold text-white/60">اسم المتجر</label>
+                                 <input type="text" value={storeInfo.name} onChange={e => setStoreInfo({...storeInfo, name: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-4 text-white focus:border-sari-purple/50 transition-colors" />
+                               </div>
+                               <div className="space-y-2">
+                                 <label className="text-sm font-bold text-white/60">رقم الهاتف</label>
+                                 <input type="text" value={storeInfo.phone} onChange={e => setStoreInfo({...storeInfo, phone: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-4 text-white focus:border-sari-purple/50 transition-colors" placeholder="اختياري" />
+                               </div>
+                               <div className="space-y-2">
+                                 <label className="text-sm font-bold text-white/60">العنوان</label>
+                                 <input type="text" value={storeInfo.address} onChange={e => setStoreInfo({...storeInfo, address: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-4 text-white focus:border-sari-purple/50 transition-colors" placeholder="بغداد, العراق" />
+                               </div>
+                               <div className="space-y-2">
+                                 <label className="text-sm font-bold text-white/60">العملة الافتراضية</label>
+                                 <select value={storeInfo.currencySymbol} onChange={e => setStoreInfo({...storeInfo, currencySymbol: e.target.value})} className="w-full bg-black/20 border border-white/10 rounded-xl p-4 text-white focus:border-sari-purple/50 transition-colors appearance-none cursor-pointer">
+                                   <option value="IQD" className="bg-gray-900">Dinar (IQD)</option>
+                                   <option value="$" className="bg-gray-900">Dollar (USD)</option>
+                                 </select>
+                               </div>
+                             </div>
+                         </div>
+                     )}
+                     
+                     {settingsTab === 'companies' && (
+                         <div className="space-y-6">
+                             <div className="flex justify-between items-center mb-6">
+                               <h3 className="text-2xl font-bold text-white flex items-center gap-3">
+                                 <div className="p-2 bg-sari-purple/20 rounded-xl text-sari-purple"><Building2 size={24}/></div>
+                                 إدارة الشركات والعملاء
+                               </h3>
+                             </div>
+                             
+                             <div className="flex gap-2 mb-6">
+                               <input type="text" value={newCompany} onChange={e=>setNewCompany(e.target.value)} placeholder="اسم جهة جديد..." className="flex-1 bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:border-sari-purple/50 transition-colors"/>
+                               <button onClick={handleAddCompany} className="px-6 bg-sari-purple hover:bg-sari-purple-deep text-white rounded-xl font-bold transition-colors flex items-center gap-2"><Plus size={18}/> إضافة</button>
+                             </div>
+
+                             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 max-h-[400px] overflow-y-auto custom-scrollbar p-1">
+                                 {storeInfo.knownCompanies.map((c, i) => (
+                                     <div key={i} className="flex justify-between items-center p-4 rounded-2xl bg-white/5 border border-white/5 hover:border-white/20 group transition-all">
+                                             <div className="flex items-center gap-3">
+                                               <div className="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center text-sm font-bold text-sari-purple-light">{c.charAt(0)}</div>
+                                               <span className="text-white font-medium">{c}</span>
+                                             </div>
+                                             <button onClick={() => handleDeleteCompany(c)} className="w-8 h-8 flex items-center justify-center rounded-lg bg-red-500/10 text-red-400 opacity-0 group-hover:opacity-100 transition-all hover:bg-red-500 hover:text-white"><Trash2 size={16}/></button>
+                                     </div>
+                                 ))}
+                             </div>
+                         </div>
+                     )}
+
+                     {settingsTab === 'security' && (
+                         <div className="flex flex-col items-center justify-center py-12 text-center space-y-4">
+                            <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center text-white/20"><ShieldCheck size={40} /></div>
+                            <div>
+                              <h3 className="text-xl font-bold text-white">إعدادات الأمان</h3>
+                              <p className="text-white/40 max-w-sm mx-auto mt-2">قريباً: تغيير كلمة المرور وإدارة الصلاحيات</p>
+                            </div>
+                         </div>
+                     )}
+
+                     {settingsTab === 'data' && (
+                         <div className="flex flex-col items-center justify-center py-12 text-center space-y-4">
+                            <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center text-white/20"><Database size={40} /></div>
+                            <div>
+                              <h3 className="text-xl font-bold text-white">إدارة البيانات</h3>
+                              <p className="text-white/40 max-w-sm mx-auto mt-2">قريباً: النسخ الاحتياطي واستعادة البيانات</p>
+                            </div>
+                         </div>
+                     )}
+                   </div>
                </div>
             </motion.div>
           )}
